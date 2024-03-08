@@ -6,6 +6,9 @@ import pandas as pd
 import torch
 from random import randrange, random
 import numpy as np
+import math
+
+import torch.distributed as dist
 
 
 """
@@ -361,29 +364,21 @@ class MPRASeqSSMDataset(torch.utils.data.Dataset):
         if val_category != None and split == 'val':
             df_raw = df_raw[df_raw['category'] == val_category]
 
-        # Select columns from input data
+        # Select columns from input data. Assume all sequences are the same length
     
         self.df = df_raw[['name','category','seq','mean']]
-
-        # Prebuild SSM dataset
-        #self.df = self.build_ssm_dataset(self.df)
-
-    def build_ssm_dataset(self, df):
-        ssm_df = pd.DataFrame(columns=['name','category','seq','mean'])
-        for i, row in df.iterrows():
-            seq = row['seq']
-            for index, character in enumerate(seq):
-                for bp in ["A","C","T","G"]:
-                    new_row = row.copy()
-                    new_seq = seq[:index] + bp + seq[index+1:]
-                    new_row['seq'] = new_seq
-                    new_row['name'] = row['name'] + ":" + seq[index] + ":" + str(index) + ":" + bp
-                    ssm_df.loc[len(ssm_df)] = new_row
-
-        return ssm_df
+        self.seq_length = len(self.df.iloc[0]['seq'])
 
     def __len__(self):
-        return 4*self.max_length*len(self.df)
+        if dist.is_available() and dist.is_initialized():
+            world_size = dist.get_world_size()
+            rank = dist.get_rank()
+        else:
+            world_size = 1
+            rank = 0
+
+        #return int((4*self.seq_length*len(self.df)) / world_size)
+        return 1000
 
     def replace_value(self, x, old_value, new_value):
         return torch.where(x == old_value, new_value, x)
@@ -391,9 +386,28 @@ class MPRASeqSSMDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         """Returns a sequence of specified len"""
 
-        bp_idx = idx%4
-        row_idx = idx%(4*self.max_length)
-        seq_idx = int(idx/(4*self.max_length))
+        # Determine rank and world size
+        worker_info = torch.utils.data.get_worker_info()
+        worker_id = worker_info.id
+        total_workers = worker_info.num_workers
+
+        if dist.is_available() and dist.is_initialized():
+            world_size = dist.get_world_size()
+            rank = dist.get_rank()
+        else:
+            world_size = 1
+            rank = 0
+        total_workers *= world_size
+
+        global_worker_id = worker_id * world_size + rank
+        per_worker = int(math.ceil((len(self.df)) / float(total_workers)))
+        row_start = global_worker_id * per_worker
+        idx = row_start + idx
+
+        # Scan sequence and mutations
+        bp_idx = idx % 4
+        seq_idx = (idx // 4) % self.seq_length
+        row_idx = (idx // 4 // self.seq_length)
 
         bp = ["A","G","T","C"][bp_idx]
 
@@ -403,12 +417,11 @@ class MPRASeqSSMDataset(torch.utils.data.Dataset):
         name, seq, mean = (row['name'], row['seq'], row['mean'])
         
         # Modify seq, name for SSM scan
-        seq = seq[:seq_idx] + bp + seq[seq_idx+1:]
-        name = name + ":" + seq[seq_idx] + ":" + str(seq_idx) + ":" + bp
-        if bp == seq[seq_idx]:
-            name += ":WT"
+        new_seq = seq[:seq_idx] + bp + seq[seq_idx+1:]
+        name = name + ";" + seq[seq_idx] + ";" + str(seq_idx) + ";" + bp
         
-        seq = self.tokenizer(seq,
+        seq = self.tokenizer(
+            new_seq,
             add_special_tokens=True if self.add_eos else False,  # this is what controls adding eos
             padding="max_length" if self.use_padding else "do_not_pad",
             max_length=self.max_length,

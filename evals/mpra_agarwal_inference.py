@@ -7,6 +7,9 @@ import yaml
 from tqdm import tqdm
 import json 
 import pandas as pd
+from pytorch_lightning import LightningModule, Trainer
+from pytorch_lightning.callbacks import BasePredictionWriter
+
 
 from src.models.sequence.long_conv_lm import DNAEmbeddingModel
 from src.tasks.decoders import AttentionDecoder
@@ -31,12 +34,17 @@ class MPRAInference:
     
     '''
     def __init__(self, cfg, ckpt_path, max_seq_len, use_dataloader=False, ssm=False):
+        self.cfg = cfg
         self.max_seq_len = max_seq_len
         self.ssm = ssm
         self.backbone, self.decoder, self.tokenizer = self.load_model(cfg, ckpt_path)
+
+        # Comment out for lightning, which auto transfers to GPU
+        '''
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.backbone = self.backbone.to(self.device)
         self.decoder = self.decoder.to(self.device)
+        '''
 
         # load dataloader if given
         if use_dataloader:
@@ -78,6 +86,12 @@ class MPRAInference:
 
         # we provide the predictions (you can pass back embeddings if you wish)
         return preds
+        
+    def predict_from_lightning(self, output_dir):            
+        model = MPRAModule(self)
+        pred_writer = PredictionWriter(output_dir)
+        trainer = Trainer(accelerator="gpu", devices="auto", strategy="ddp", callbacks=[pred_writer])
+        trainer.predict(model, dataloaders=self.loader.test_dataloader())
         
     def predict_from_loader(self):
         """
@@ -160,8 +174,86 @@ class MPRAInference:
         )
 
         return backbone, decoder, tokenizer
+class PredictionWriter(BasePredictionWriter):
+    def __init__(self, output_dir, write_interval='epoch'):
+        super().__init__(write_interval)
+        self.output_dir = output_dir
+
+    def write_on_epoch_end(self, trainer, pl_module, predictions, batch_indices):
+        name_lst = []
+        pred_lst = []
+        for batch in predictions[0]:
+            names, preds = batch
+            name_lst.append(np.array(names))
+            pred_lst.append(preds.flatten())
+
+        names = np.hstack(name_lst)
+        preds = torch.flatten(torch.hstack(pred_lst))
+
+        df = pd.DataFrame({"name":names, "pred":preds})
+        df.to_csv(f"{self.output_dir}/predictions.csv", index=False)
+class MPRAModule(LightningModule):
+    def __init__(self, cfg, ckpt_path, max_seq_len):
+        super().__init__()
+        self.backbone, self.decoder, self.tokenizer = self.load_model(cfg, ckpt_path, max_seq_len)
+
+    def load_model(self, cfg, ckpt_path, max_seq_len):
+        # get the configs
+        cfg = yaml.load(open(cfg, 'r'), Loader=yaml.FullLoader)
+        train_cfg = cfg['train']  # grab section `train` section of config
+        model_cfg = cfg['model']  # grab the `model` section of config
+
+        self.d_output = train_cfg['d_output']  # number of classes the head was trained on
+
+        # the state dict has both the backbone model and the decoder (normally as a Lightning module), but we need to instantiate both separately
+        # when not using Lightning.
+
+        # instantiate the model
+        backbone = DNAEmbeddingModel(**model_cfg)   # instantiate the backbone separately from the decoder
+
+        # instantiate the decoder
+        decoder = AttentionDecoder(model_cfg['d_model'], d_output=self.d_output)  # needs to know the d_model
+
+        state_dict = torch.load(ckpt_path, map_location='cpu')  # has both backbone and decoder
         
-        
+        # loads model from ddp by removing prexix to single if necessary
+        torch.nn.modules.utils.consume_prefix_in_state_dict_if_present(
+            state_dict["state_dict"], "model."
+        )
+
+        model_state_dict = state_dict["state_dict"]
+
+        # need to remove torchmetrics. to remove keys, need to convert to list first
+        for key in list(model_state_dict.keys()):
+            if "torchmetrics" in key:
+                model_state_dict.pop(key)
+
+        # the state_dict keys slightly mismatch from Lightning..., so we fix it here
+        decoder_state_dict = {}
+        for key in list(model_state_dict.keys()):
+            if 'decoder' in key:
+                decoder_key = '.'.join(key.split('.')[2:])
+                decoder_state_dict[decoder_key] = model_state_dict.pop(key)
+
+        # now actually load the state dict to the decoder and backbone separately
+        decoder.load_state_dict(decoder_state_dict, strict=True)
+        backbone.load_state_dict(model_state_dict, strict=True)
+
+        # setup tokenizer
+        tokenizer = CharacterTokenizer(
+            characters=['A', 'C', 'G', 'T', 'N'],
+            model_max_length=max_seq_len + 2,  # add 2 since default adds eos/eos tokens, crop later
+            add_special_tokens=False,
+        )
+
+        return backbone, decoder, tokenizer
+    
+    def forward(self, batch):
+        name, x, y = batch
+        embeddings, _ = self.backbone(x)
+        pred = self.decoder(embeddings)
+        return name, pred
+
 if __name__ == "__main__":
     
     """
@@ -225,10 +317,24 @@ if __name__ == "__main__":
     )
         
     args = parser.parse_args()
-
     config = args.config
+    if not os.path.exists(args.output_path):
+        # If it does not exist, create it
+        os.makedirs(args.output_path)
 
-    task = MPRAInference(config, args.ckpt_path, max_seq_len=1024, use_dataloader=True, ssm=args.ssm)
+    # Use lightning for prediction
+    def get_dataloader(config):
+        cfg = yaml.load(open(config, 'r'), Loader=yaml.FullLoader)
+        dataset_name = cfg['dataset']["dataset_name"]
+        loader = MPRASSMSeq(**cfg['dataset'])
+        loader.setup()
+        return loader
+    
+    model = MPRAModule(config, args.ckpt_path, max_seq_len=1024)
+    loader = get_dataloader(config)
+    pred_writer = PredictionWriter(args.output_path)
+    trainer = Trainer(accelerator="gpu", devices=1, callbacks=[pred_writer])
+    trainer.predict(model, dataloaders=loader.test_dataloader())
 
     # sample sequence, can pass a list of seqs (themselves a list of chars)
     #seqs = ["ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT"]
@@ -246,7 +352,7 @@ if __name__ == "__main__":
     breakpoint()
     '''
     
-
+    '''
     # OR...
 
     # or if you rather use the existing dataloader for the enhancer dataset, you can call this instead
@@ -283,4 +389,4 @@ if __name__ == "__main__":
     # save as csv
     preds_df = pd.DataFrame({"names":names, "labels":labels_np.flatten(), "preds":preds_np.flatten()})
     preds_df.to_csv(os.path.join(args.output_path, "preds.csv"), index=False)
-        
+    '''
