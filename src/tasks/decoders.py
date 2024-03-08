@@ -272,6 +272,40 @@ class PackedDecoder(Decoder):
     def forward(self, x, state=None):
         x, _ = nn.utils.rnn.pad_packed_sequence(x, batch_first=True)
         return x
+    
+class AttentionDecoder(Decoder):
+    """Decoder for single target (e.g. classification or regression)"""
+    def __init__(self, d_model, d_output=None):
+        super().__init__()
+
+        self.d_model = d_model
+        self.d_output = d_output
+
+        # Attention pooling
+        self.attention_pool = nn.Linear(self.d_model, 1)
+
+        # Regression head
+        '''
+        layers = []
+        layers.append(nn.Linear(d_model, d_model))
+        layers.append(nn.ReLU())
+        layers.append(nn.Linear(self.d_model, 1))
+        self.head = nn.Sequential(*layers)
+        '''
+        
+        # Linear projection
+        self.head = nn.Linear(self.d_model, 1)
+
+    def forward(self, x, state=None):
+        """
+        x: (n_batch, l_seq, d_model)
+        Returns: (n_batch, l_output, d_output)
+        """
+
+        # Attention pooling operation
+        x = torch.matmul(F.softmax(self.attention_pool(x), dim=1).transpose(-1, -2), x).squeeze(-2)
+        x = self.head(x)
+        return x
 
 
 # For every type of encoder/decoder, specify:
@@ -289,6 +323,7 @@ registry = {
     "state": StateDecoder,
     "pack": PackedDecoder,
     "token": TokenDecoder,
+    "attention": AttentionDecoder,
 }
 model_attrs = {
     "linear": ["d_output"],
@@ -298,6 +333,7 @@ model_attrs = {
     "state": ["d_state", "state_to_tensor"],
     "forecast": ["d_output"],
     "token": ["d_output"],
+    "attention": ["d_output"],
 }
 
 dataset_attrs = {
@@ -308,6 +344,7 @@ dataset_attrs = {
     "state": ["d_output"],
     "forecast": ["d_output", "l_output"],
     "token": ["d_output"],
+    "attention": ["d_output"],
 }
 
 
