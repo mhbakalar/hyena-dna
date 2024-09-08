@@ -3,7 +3,7 @@
 Fine-tuning HyenaDNA on MPRA data from Agarwal et al. Added site-saturating mutagenesis evals for mapping TF-binding motifs across the global dataset and across specific promoter/enhancer sequences.
 - [biorxiv](10.1101/2023.03.05.531189)
 
-# HyenaDNA original Readme
+# HyenaDNA README
 
 ![HyenaDNA_pipeline](assets/pipeline.png "HyenaDNA")
 
